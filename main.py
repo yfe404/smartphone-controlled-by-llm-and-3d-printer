@@ -11,6 +11,8 @@ import threading
 from functools import wraps
 import serial
 import time
+from PIL import Image, ImageDraw
+import io
 
 app = Flask(__name__)
 openai_client = AsyncOpenAI()
@@ -75,6 +77,46 @@ def async_route(f):
             loop.close()
     return wrapper
 
+def add_grid_overlay(image_path, grid_size=20, grid_color=(255, 255, 255, 128)):
+    """
+    Add grid overlay to image using PIL
+    Args:
+        image_path: Path to the image file
+        grid_size: Size of grid squares in pixels (default 20)
+        grid_color: RGBA color tuple for grid lines (default semi-transparent white)
+    Returns:
+        PIL Image object with grid overlay
+    """
+    # Open the image
+    image = Image.open(image_path)
+    
+    # Convert to RGBA if not already (for transparency support)
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    
+    # Create a transparent overlay
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    
+    width, height = image.size
+    
+    # Draw vertical lines
+    for x in range(0, width + 1, grid_size):
+        draw.line([(x, 0), (x, height)], fill=grid_color, width=2)
+    
+    # Draw horizontal lines
+    for y in range(0, height + 1, grid_size):
+        draw.line([(0, y), (width, y)], fill=grid_color, width=2)
+    
+    # Composite the overlay onto the original image
+    result = Image.alpha_composite(image, overlay)
+    
+    # Convert back to RGB if needed (for JPEG output)
+    if result.mode == 'RGBA':
+        result = result.convert('RGB')
+    
+    return result
+
 @app.route('/take_picture', methods=['POST'])
 def take_picture():
     """
@@ -103,7 +145,8 @@ def take_picture():
                 "message": "Picture taken successfully",
                 "filename": filename,
                 "filepath": filepath,
-                "download_url": f"/download_image/{filename}"
+                "download_url": f"/download_image/{filename}",
+                "download_url_with_grid": f"/download_image/{filename}?grid=true"
             }), 200
         else:
             return jsonify({
@@ -121,13 +164,55 @@ def take_picture():
 def download_image(filename):
     """
     Endpoint to download the captured image
+    Query parameters:
+        grid=true : Add 20px grid overlay to the image
+        grid_size=N : Custom grid size in pixels (default 20)
+        grid_color=RRGGBB : Grid color in hex format (default FFFFFF)
+        grid_opacity=N : Grid opacity 0-255 (default 128)
     """
     try:
         filepath = os.path.join("/tmp", filename)
-        if os.path.exists(filepath):
-            return send_file(filepath, as_attachment=True, download_name=filename)
-        else:
+        if not os.path.exists(filepath):
             return jsonify({"error": "File not found"}), 404
+        
+        # Check if grid overlay is requested
+        add_grid = request.args.get('grid', 'false').lower() == 'true'
+        
+        if add_grid:
+            # Get grid parameters from query string
+            grid_size = int(request.args.get('grid_size', 20))
+            grid_color_hex = request.args.get('grid_color', 'FFFFFF')
+            grid_opacity = int(request.args.get('grid_opacity', 128))
+            
+            # Convert hex color to RGB
+            try:
+                grid_color = tuple(int(grid_color_hex[i:i+2], 16) for i in (0, 2, 4))
+                grid_color = (*grid_color, grid_opacity)  # Add alpha channel
+            except:
+                grid_color = (255, 255, 255, 128)  # Default white with transparency
+            
+            # Create image with grid overlay
+            image_with_grid = add_grid_overlay(filepath, grid_size, grid_color)
+            
+            # Save to memory buffer
+            img_buffer = io.BytesIO()
+            image_with_grid.save(img_buffer, format='JPEG', quality=95)
+            img_buffer.seek(0)
+            
+            # Create new filename for grid version
+            name, ext = os.path.splitext(filename)
+            grid_filename = f"{name}_grid{ext}"
+            
+            return send_file(
+                img_buffer,
+                mimetype='image/jpeg',
+                as_attachment=True,
+                download_name=grid_filename
+            )
+        else:
+            # Return original image without grid
+            return send_file(filepath, as_attachment=True, download_name=filename)
+            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -291,7 +376,18 @@ def index():
             },
             "/download_image/<filename>": {
                 "method": "GET", 
-                "description": "Download captured image"
+                "description": "Download captured image",
+                "query_parameters": {
+                    "grid": "Set to 'true' to add grid overlay (default: false)",
+                    "grid_size": "Grid size in pixels (default: 20)",
+                    "grid_color": "Grid color in hex format RRGGBB (default: FFFFFF)",
+                    "grid_opacity": "Grid opacity 0-255 (default: 128)"
+                },
+                "examples": [
+                    "/download_image/photo_123.jpg",
+                    "/download_image/photo_123.jpg?grid=true",
+                    "/download_image/photo_123.jpg?grid=true&grid_size=30&grid_color=FF0000&grid_opacity=200"
+                ]
             },
             "/speak": {
                 "method": "POST",
